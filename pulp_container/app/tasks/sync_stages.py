@@ -118,7 +118,7 @@ class ContainerFirstStage(Stage):
 
         Returns True only if:
         - include_tags is populated (specific refs to sync)
-        - exclude_tags is empty (no exclusions to apply against full list)
+        - exclude_tags is empty OR won't match any includes (harmless)
         - No wildcards in include_tags (need exact refs, not patterns)
         - Not in mirror mode (would need full list to detect removals)
         """
@@ -127,8 +127,21 @@ class ContainerFirstStage(Stage):
 
         if not include_tags:
             return False
+
+        # If excludes exist, check if they're harmless (won't match our includes)
         if exclude_tags:
-            return False
+            # Satellite often adds '*-source' exclude which doesn't match sha256 digests
+            # If all our includes are sha256 digests and excludes only have patterns
+            # that won't match digests, we can still bypass
+            all_digests = all(tag.startswith('sha256:') for tag in include_tags)
+            harmless_excludes = all(
+                exclude.endswith('-source') or
+                (exclude.startswith('*') and not any(tag.endswith(exclude.lstrip('*')) for tag in include_tags))
+                for exclude in exclude_tags
+            )
+            if not (all_digests and harmless_excludes):
+                return False
+
         if self.mirror:
             return False
 
