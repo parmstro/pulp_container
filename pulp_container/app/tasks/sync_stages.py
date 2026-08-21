@@ -173,7 +173,7 @@ class ContainerFirstStage(Stage):
             if self.remote.auto_discover_cosign:
                 log.info("Auto-discovering cosign companion tags via HEAD probing")
                 companion_tags = await self._discover_cosign_companions_without_taglist(
-                    self._synced_digests.keys()
+                    self._synced_digests
                 )
                 if companion_tags:
                     log.info(
