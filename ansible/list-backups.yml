@@ -1,0 +1,104 @@
+---
+# Ansible Playbook: List Available Backups
+#
+# Shows all available backups that can be used for rollback
+#
+# Usage:
+#   ansible-playbook -i inventory.yml list-backups.yml
+#
+
+- name: List available pulp_container backups
+  hosts: satellite_servers
+  gather_facts: yes
+
+  tasks:
+    - name: Check if backup directory exists
+      stat:
+        path: "{{ backup_base_dir }}"
+      register: backup_dir
+
+    - name: Find all backups
+      find:
+        paths: "{{ backup_base_dir }}"
+        file_type: directory
+        recurse: no
+      register: backup_dirs
+      when: backup_dir.stat.exists
+
+    - name: Get backup manifests
+      slurp:
+        src: "{{ item.path }}/BACKUP_MANIFEST.txt"
+      register: manifests
+      loop: "{{ backup_dirs.files }}"
+      when: backup_dir.stat.exists
+      failed_when: false
+
+    - name: Check for deployment success markers
+      stat:
+        path: "{{ item.path }}/DEPLOYMENT_SUCCESS.txt"
+      register: success_markers
+      loop: "{{ backup_dirs.files }}"
+      when: backup_dir.stat.exists
+
+    - name: Check for rollback markers
+      stat:
+        path: "{{ item.path }}/ROLLBACK_SUCCESS.txt"
+      register: rollback_markers
+      loop: "{{ backup_dirs.files }}"
+      when: backup_dir.stat.exists
+
+    - name: Display backup information
+      debug:
+        msg: |
+          ========================================
+          AVAILABLE BACKUPS
+          ========================================
+          {% if not backup_dir.stat.exists %}
+          No backup directory found at {{ backup_base_dir }}
+          {% elif backup_dirs.matched == 0 %}
+          No backups found in {{ backup_base_dir }}
+          {% else %}
+          {% for item in backup_dirs.files %}
+
+          Backup: {{ item.path }}
+          Created: {{ item.path | basename }}
+          Size: {{ (item.size / 1024 / 1024) | round(2) }} MB
+          {% if success_markers.results[loop.index0].stat.exists %}
+          Status: ✓ Deployment successful
+          {% elif rollback_markers.results[loop.index0].stat.exists %}
+          Status: ↺ Rolled back
+          {% else %}
+          Status: ⚠ Unknown (check manually)
+          {% endif %}
+
+          Manifest:
+          {% if manifests.results[loop.index0].content is defined %}
+          {{ manifests.results[loop.index0].content | b64decode | indent(2) }}
+          {% else %}
+          (No manifest found)
+          {% endif %}
+          {% endfor %}
+
+          Latest symlink points to:
+          {% if (backup_base_dir + '/latest') is link %}
+          {{ lookup('file', backup_base_dir + '/latest') | default('(broken symlink)') }}
+          {% else %}
+          (No latest symlink)
+          {% endif %}
+          {% endif %}
+
+          ========================================
+
+          To rollback to a specific backup:
+          ansible-playbook -i inventory.yml rollback-optimization.yml \
+            -e backup_path=/path/to/backup
+
+          To rollback to latest:
+          ansible-playbook -i inventory.yml rollback-optimization.yml
+          ========================================
+
+    - name: Cleanup old backups (optional)
+      debug:
+        msg: |
+          To remove backups older than {{ backup_retention_days }} days:
+          ansible-playbook -i inventory.yml cleanup-backups.yml

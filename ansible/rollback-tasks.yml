@@ -1,0 +1,127 @@
+---
+# Rollback tasks - included by both rollback playbook and deploy rescue block
+# This file contains the actual rollback logic
+
+- name: Search for pulp_container installation (for rollback)
+  shell: |
+    # Try multiple search methods
+    if [ -d /usr/lib/python3.12/site-packages/pulp_container ]; then
+      echo "/usr/lib/python3.12/site-packages/pulp_container"
+    elif [ -d /usr/lib/python3.11/site-packages/pulp_container ]; then
+      echo "/usr/lib/python3.11/site-packages/pulp_container"
+    else
+      find /usr -name "pulp_container" -type d 2>/dev/null | grep site-packages | head -1
+    fi
+  register: pulp_container_search_rollback
+  changed_when: false
+  when: pulp_container_app_path is not defined
+
+- name: Set pulp_container paths (for rollback)
+  set_fact:
+    pulp_container_python_path: "{{ pulp_container_search_rollback.stdout }}"
+    pulp_container_app_path: "{{ pulp_container_search_rollback.stdout }}/app"
+  when: pulp_container_app_path is not defined and pulp_container_search_rollback.stdout != ""
+
+- name: Stop pulp services for rollback
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+  loop: "{{ pulp_services }}"
+  ignore_errors: yes
+
+- name: Restore Python files from backup
+  copy:
+    src: "{{ backup_path }}/{{ item.name }}"
+    dest: "{{ item.path }}"
+    remote_src: yes
+    mode: preserve
+  loop: "{{ pulp_container_files_to_backup }}"
+  when: not (item.is_directory | default(false))
+
+- name: Restore migrations directory from backup
+  synchronize:
+    src: "{{ backup_path }}/{{ item.name }}/"
+    dest: "{{ item.path }}/"
+    archive: yes
+    delete: yes
+  delegate_to: "{{ inventory_hostname }}"
+  loop: "{{ pulp_container_files_to_backup }}"
+  when: item.is_directory | default(false)
+
+- name: Remove migration file if it exists
+  file:
+    path: "{{ pulp_container_app_path }}/migrations/{{ migration_file }}"
+    state: absent
+
+- name: Rollback database migration
+  become_user: pulp
+  shell: |
+    pulpcore-manager migrate {{ migration_app }} 0045_alter_manifest_compressed_image_size
+  environment:
+    PULP_SETTINGS: /etc/pulp/settings.py
+    DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+  register: migration_rollback
+  failed_when: false
+
+- name: Display migration rollback output
+  debug:
+    var: migration_rollback.stdout_lines
+  when: migration_rollback.stdout_lines is defined
+
+- name: Restore database table from backup
+  become_user: "{{ postgres_user }}"
+  postgresql_db:
+    name: "{{ pulp_db_name }}"
+    state: restore
+    target: "{{ backup_path }}/container_containerremote.sql"
+  when: migration_rollback is failed
+
+- name: Verify migration rollback
+  become_user: "{{ postgres_user }}"
+  postgresql_query:
+    db: "{{ pulp_db_name }}"
+    query: |
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name='container_containerremote'
+      AND column_name='auto_discover_cosign'
+  register: column_verify
+
+- name: Confirm column removed
+  debug:
+    msg: "Column auto_discover_cosign removed: {{ column_verify.rowcount == 0 }}"
+
+- name: Restart pulp services after rollback
+  systemd:
+    name: "{{ item }}"
+    state: restarted
+  loop: "{{ pulp_services }}"
+
+- name: Wait for services to stabilize
+  wait_for:
+    timeout: 30
+
+- name: Verify services are running
+  systemd:
+    name: "{{ item }}"
+  register: service_verify
+  failed_when: service_verify.status.ActiveState != "active"
+  loop: "{{ pulp_services }}"
+
+- name: Wait for Pulp API to be responsive
+  shell: curl -k -s -o /dev/null -w "%{http_code}" https://{{ ansible_host }}/pulp/api/v3/status/
+  register: api_check
+  until: api_check.stdout == "200"
+  retries: 12
+  delay: 5
+  changed_when: false
+
+- name: Create rollback success marker
+  copy:
+    content: |
+      Rollback successful
+      Completed: {{ ansible_date_time.iso8601 }}
+      Reason: {{ rollback_reason | default('Manual rollback requested') }}
+      Restored from: {{ backup_path }}
+    dest: "{{ backup_path }}/ROLLBACK_SUCCESS.txt"
+    mode: '0644'

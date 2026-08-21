@@ -1,0 +1,233 @@
+---
+# Ansible Playbook: Test Prerequisites
+#
+# Validates that all prerequisites are met before deployment
+#
+# Usage:
+#   ansible-playbook -i inventory.yml test-prerequisites.yml
+#
+
+- name: Test deployment prerequisites
+  hosts: satellite_servers
+  gather_facts: yes
+
+  tasks:
+    - name: Test SSH connectivity
+      ping:
+      register: ping_result
+
+    - name: Check user privileges
+      command: whoami
+      register: whoami_result
+      changed_when: false
+
+    - name: Check if running as root
+      set_fact:
+        is_root: "{{ whoami_result.stdout == 'root' }}"
+
+    - name: Test sudo access (if not root)
+      command: sudo -n whoami
+      register: sudo_test
+      changed_when: false
+      failed_when: false
+      when: not is_root
+
+    - name: Check Satellite installation
+      stat:
+        path: /usr/bin/satellite-maintain
+      register: satellite_cmd
+
+    - name: Get Satellite version
+      command: satellite-maintain packages list
+      register: satellite_packages
+      changed_when: false
+      failed_when: false
+      when: satellite_cmd.stat.exists
+
+    - name: Check PostgreSQL
+      systemd:
+        name: postgresql
+      register: postgres_service
+
+    - name: Test database connection
+      become_user: postgres
+      postgresql_query:
+        db: "{{ pulp_db_name }}"
+        query: "SELECT version()"
+      register: db_version
+      failed_when: false
+
+    - name: Search for pulp_container installation
+      shell: |
+        # Try multiple search methods
+        if [ -d /usr/lib/python3.12/site-packages/pulp_container ]; then
+          echo "/usr/lib/python3.12/site-packages/pulp_container"
+        elif [ -d /usr/lib/python3.11/site-packages/pulp_container ]; then
+          echo "/usr/lib/python3.11/site-packages/pulp_container"
+        else
+          find /usr -name "pulp_container" -type d 2>/dev/null | grep site-packages | head -1
+        fi
+      register: pulp_container_search
+      changed_when: false
+
+    - name: Set pulp_container paths
+      set_fact:
+        pulp_container_python_path: "{{ pulp_container_search.stdout }}"
+        pulp_container_app_path: "{{ pulp_container_search.stdout }}/app"
+      when: pulp_container_search.stdout != ""
+
+    - name: Check pulp_container installation
+      stat:
+        path: "{{ pulp_container_app_path }}"
+      register: pulp_path
+      when: pulp_container_search.stdout != ""
+
+    - name: Find pulp_container version
+      shell: |
+        pip3 list | grep pulp-container || rpm -qa | grep pulp_container
+      register: pulp_version
+      changed_when: false
+      failed_when: false
+
+    - name: Check source repository
+      stat:
+        path: "{{ pulp_container_repo_path }}"
+      register: source_repo
+      delegate_to: localhost
+
+    - name: Check source branch
+      command: git -C {{ pulp_container_repo_path }} branch --show-current
+      register: git_branch
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      when: source_repo.stat.exists
+
+    - name: Check required files in source
+      stat:
+        path: "{{ pulp_container_repo_path }}/{{ item }}"
+      register: source_files
+      delegate_to: localhost
+      loop:
+        - pulp_container/app/models.py
+        - pulp_container/app/tasks/sync_stages.py
+        - pulp_container/app/tasks/synchronize.py
+        - pulp_container/app/migrations/0051_containerremote_auto_discover_cosign.py
+      when: source_repo.stat.exists
+
+    - name: Check Ansible collections
+      command: ansible-galaxy collection list community.postgresql
+      register: ansible_collections
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: Check for existing backups
+      find:
+        paths: "{{ backup_base_dir }}"
+        file_type: directory
+      register: existing_backups
+      failed_when: false
+
+    - name: Check disk space
+      shell: df -h {{ backup_base_dir | dirname }} | tail -1 | awk '{print $4}'
+      register: disk_space
+      changed_when: false
+
+    # ========================================================================
+    # RESULTS SUMMARY
+    # ========================================================================
+
+    - name: Prerequisites check header
+      debug:
+        msg: "======================================== PREREQUISITES CHECK RESULTS ========================================"
+
+    - name: Check connectivity
+      debug:
+        msg: "CONNECTIVITY: {{ '✓ SSH successful' if ping_result is success else '✗ SSH failed' }} | {{ '✓ Running as root' if is_root else ('⚠ Running as ' + whoami_result.stdout + ' (sudo available)' if sudo_test is success else '✗ Not root, no sudo') }}"
+
+    - name: Check Satellite
+      debug:
+        msg: "SATELLITE: {{ '✓ Satellite tools found' if satellite_cmd.stat.exists else '✗ Satellite not found' }}"
+
+    - name: Check PostgreSQL
+      debug:
+        msg: "DATABASE: {{ '✓ PostgreSQL running' if postgres_service.status.ActiveState == 'active' else '✗ PostgreSQL not running' }} | {{ '✓ Database accessible' if db_version is success else '✗ Database not accessible' }}"
+
+    - name: Check pulp_container
+      debug:
+        msg: "PULP_CONTAINER: {{ '✓ Installed at ' + pulp_container_python_path + ' (' + (pulp_container_python_path | regex_search('python3\\.[0-9]+')) + ')' if pulp_container_search.stdout != '' and pulp_path.stat.exists else '✗ Not found in /usr/lib/python3*/site-packages' }}"
+
+    - name: Check source repository
+      debug:
+        msg: "SOURCE CODE: {{ '✓ Found at ' + pulp_container_repo_path + ' (branch: ' + git_branch.stdout + ')' if source_repo.stat.exists else '✗ Not found at ' + pulp_container_repo_path }}"
+
+    - name: Check required source files
+      debug:
+        msg: "  {{ '✓' if item.stat.exists else '✗' }} {{ item.item }}"
+      loop: "{{ source_files.results }}"
+      when: source_repo.stat.exists and source_files.results is defined
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Check Ansible collections
+      debug:
+        msg: "ANSIBLE: {{ '✓ community.postgresql installed' if ansible_collections.rc == 0 else '✗ community.postgresql NOT installed - run: ansible-galaxy collection install -r requirements.yml' }}"
+
+    - name: Check backups
+      debug:
+        msg: "BACKUPS: Directory {{ backup_base_dir }} | Existing: {{ existing_backups.matched | default(0) }} | Disk space: {{ disk_space.stdout | default('unknown') }}"
+
+    - name: Prerequisites footer
+      debug:
+        msg: "========================================================================================================"
+
+    - name: Set overall readiness
+      set_fact:
+        ready_to_deploy: >-
+          {{ ping_result is success and
+             (is_root or sudo_test is success) and
+             satellite_cmd.stat.exists and
+             postgres_service.status.ActiveState == 'active' and
+             db_version is success and
+             pulp_path.stat.exists and
+             source_repo.stat.exists and
+             source_files.results | selectattr('stat.exists') | list | length == 4 }}
+
+    - name: Prerequisites met - ready to deploy
+      pause:
+        seconds: 1
+        prompt: |
+
+          ========================================
+          ✓ ALL PREREQUISITES MET
+          ========================================
+
+          Your system is ready for deployment!
+
+          Next steps:
+          1. Review the deployment plan: cat ansible/README.md
+          2. Run a dry-run: ansible-playbook -i inventory.yml deploy-optimization.yml --check
+          3. Deploy: ansible-playbook -i inventory.yml deploy-optimization.yml
+
+      when: ready_to_deploy
+
+    - name: Prerequisites not met
+      pause:
+        seconds: 1
+        prompt: |
+
+          ========================================
+          ✗ PREREQUISITES NOT MET
+          ========================================
+
+          Please resolve the issues marked with ✗ above before deploying.
+
+          Common fixes:
+          - SSH connectivity: Check firewall, SSH keys, ansible_user in inventory
+          - Root/sudo: Use --become flag or update ansible_user to root
+          - Database: Start PostgreSQL: systemctl start postgresql
+          - Source code: Check pulp_container_repo_path in inventory.yml
+          - Ansible collections: ansible-galaxy collection install -r requirements.yml
+
+      when: not ready_to_deploy

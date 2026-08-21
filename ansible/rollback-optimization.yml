@@ -1,0 +1,224 @@
+---
+# Ansible Playbook: Rollback Tag List Bypass Optimization
+#
+# This playbook safely rolls back the pulp_container optimization by:
+# - Restoring files from backup
+# - Rolling back database migration
+# - Restarting services
+# - Verifying system health
+#
+# Usage:
+#   # Rollback from latest backup
+#   ansible-playbook -i inventory.yml rollback-optimization.yml
+#
+#   # Rollback from specific backup
+#   ansible-playbook -i inventory.yml rollback-optimization.yml \
+#     -e backup_path=/var/lib/pulp-backups/20260814T120000
+#
+#   # Dry-run
+#   ansible-playbook -i inventory.yml rollback-optimization.yml --check
+#
+
+- name: Rollback pulp_container Tag List Bypass Optimization
+  hosts: satellite_servers
+  gather_facts: yes
+  vars:
+    rollback_log: "/var/log/pulp-container-optimization-rollback-{{ ansible_date_time.iso8601_basic_short }}.log"
+    # Use latest backup if not specified
+    backup_path: "{{ backup_path | default(backup_base_dir + '/latest') }}"
+
+  tasks:
+    # ========================================================================
+    # PRE-ROLLBACK VALIDATION
+    # ========================================================================
+
+    - name: Pre-rollback validation
+      tags: [always]
+      block:
+        - name: Search for pulp_container installation
+          shell: |
+            # Try multiple search methods
+            if [ -d /usr/lib/python3.12/site-packages/pulp_container ]; then
+              echo "/usr/lib/python3.12/site-packages/pulp_container"
+            elif [ -d /usr/lib/python3.11/site-packages/pulp_container ]; then
+              echo "/usr/lib/python3.11/site-packages/pulp_container"
+            else
+              find /usr -name "pulp_container" -type d 2>/dev/null | grep site-packages | head -1
+            fi
+          register: pulp_container_search
+          changed_when: false
+
+        - name: Fail if pulp_container not found
+          fail:
+            msg: "pulp_container installation not found! Cannot perform rollback."
+          when: pulp_container_search.stdout == ""
+
+        - name: Set pulp_container paths
+          set_fact:
+            pulp_container_python_path: "{{ pulp_container_search.stdout }}"
+            pulp_container_app_path: "{{ pulp_container_search.stdout }}/app"
+
+        - name: Display discovered pulp_container location
+          debug:
+            msg: "Found pulp_container at: {{ pulp_container_python_path }}"
+
+        - name: Create rollback log
+          copy:
+            content: |
+              Pulp Container Optimization Rollback
+              Started: {{ ansible_date_time.iso8601 }}
+              Host: {{ ansible_hostname }}
+              User: {{ ansible_user_id }}
+              Backup path: {{ backup_path }}
+            dest: "{{ rollback_log }}"
+            mode: '0644'
+
+        - name: Resolve latest backup symlink if needed
+          stat:
+            path: "{{ backup_path }}"
+          register: backup_stat
+
+        - name: Update backup_path if it's a symlink
+          set_fact:
+            backup_path: "{{ backup_stat.stat.lnk_source }}"
+          when: backup_stat.stat.islnk
+
+        - name: Display backup path being used
+          debug:
+            msg: "Rolling back from: {{ backup_path }}"
+
+        - name: Check if backup exists
+          stat:
+            path: "{{ backup_path }}/BACKUP_MANIFEST.txt"
+          register: backup_check
+
+        - name: Fail if backup not found
+          fail:
+            msg: "Backup not found at {{ backup_path }}. Available backups in {{ backup_base_dir }}/. List with: ansible-playbook -i inventory.yml list-backups.yml"
+          when: not backup_check.stat.exists
+
+        - name: Display backup manifest
+          slurp:
+            src: "{{ backup_path }}/BACKUP_MANIFEST.txt"
+          register: manifest
+
+        - name: Show backup details
+          debug:
+            msg: "{{ manifest.content | b64decode }}"
+
+        - name: Confirm rollback
+          pause:
+            prompt: |
+
+              ========================================
+              ROLLBACK CONFIRMATION
+              ========================================
+              You are about to rollback the pulp_container optimization.
+
+              This will:
+              1. Restore Python files from backup
+              2. Rollback database migration
+              3. Restart Pulp services
+              4. Remove the auto_discover_cosign feature
+
+              Backup location: {{ backup_path }}
+
+              Press Ctrl+C and then 'A' to abort.
+              Press Enter to continue with rollback.
+              ========================================
+
+          when: not (auto_confirm | default(false))
+
+    # ========================================================================
+    # PERFORM ROLLBACK
+    # ========================================================================
+
+    - name: Execute rollback
+      tags: [rollback]
+      block:
+        - name: Include rollback tasks
+          include_tasks: rollback-tasks.yml
+          vars:
+            rollback_reason: "Manual rollback requested by {{ ansible_user_id }}"
+
+    # ========================================================================
+    # POST-ROLLBACK VERIFICATION
+    # ========================================================================
+
+    - name: Post-rollback verification
+      tags: [always, verify]
+      block:
+        - name: Check Satellite health
+          shell: satellite-maintain health check --assumeyes
+          register: health_check
+          failed_when: false
+
+        - name: Display health check results
+          debug:
+            var: health_check.stdout_lines
+
+        - name: Verify optimization is removed
+          become_user: "{{ postgres_user }}"
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: |
+              SELECT column_name
+              FROM information_schema.columns
+              WHERE table_name='container_containerremote'
+              AND column_name='auto_discover_cosign'
+          register: feature_check
+
+        - name: Confirm feature removed
+          assert:
+            that: feature_check.rowcount == 0
+            fail_msg: "Feature not properly removed - auto_discover_cosign column still exists"
+            success_msg: "Feature successfully removed"
+
+        - name: Check Python file restoration
+          stat:
+            path: "{{ item.path }}"
+          register: file_check
+          loop: "{{ pulp_container_files_to_backup }}"
+          when: not (item.is_directory | default(false))
+
+        - name: Verify all files restored
+          assert:
+            that: item.stat.exists
+            fail_msg: "File {{ item.item.path }} was not restored"
+          loop: "{{ file_check.results }}"
+          when: not item.skipped | default(false)
+
+    # ========================================================================
+    # FINAL REPORT
+    # ========================================================================
+
+    - name: Rollback completed successfully
+      tags: [always]
+      pause:
+        seconds: 1
+        prompt: |
+
+          ========================================
+          ROLLBACK COMPLETED SUCCESSFULLY
+          ========================================
+          Timestamp: {{ ansible_date_time.iso8601 }}
+          Host: {{ ansible_hostname }}
+          Restored from: {{ backup_path }}
+
+          Services status: All running
+          API status: Healthy
+          Database: Migration rolled back
+          Feature removed: auto_discover_cosign
+
+          The system has been restored to its previous state.
+
+          Review rollback log: {{ rollback_log }}
+
+          The backup at {{ backup_path }} has been preserved
+          and can be removed manually if no longer needed.
+          ========================================
+
+  rescue:
+    - name: Rollback failed
+      fail:
+        msg: "ROLLBACK FAILED! System may be inconsistent. Check logs at {{ rollback_log }}. Backup intact at {{ backup_path }}"

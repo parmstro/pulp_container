@@ -1,0 +1,16 @@
+---
+# Ansible Galaxy Requirements
+# Install with: ansible-galaxy collection install -r requirements.yml
+
+collections:
+  # PostgreSQL collection for database operations
+  # Used for: postgresql_query, postgresql_db modules
+  - name: community.postgresql
+    version: ">=3.0.0"
+    source: https://galaxy.ansible.com
+
+  # General utilities collection
+  # Used for: various utility modules
+  - name: community.general
+    version: ">=8.0.0"
+    source: https://galaxy.ansible.com

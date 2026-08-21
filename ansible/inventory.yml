@@ -1,0 +1,38 @@
+---
+# Ansible Inventory for Satellite 6.19.3 Deployment
+# Update this file with your Satellite instance details
+
+all:
+  children:
+    satellite_servers:
+      hosts:
+        satellite1:
+          ansible_host: satellite1.parmstrong.ca
+          ansible_user: ansiblerunner
+          ansible_become: yes
+          ansible_python_interpreter: /usr/bin/python3.12
+
+          # Satellite-specific variables
+          satellite_admin_user: admin
+          satellite_organization: "Default Organization"
+
+          # Backup configuration
+          backup_base_dir: /var/lib/pulp-backups
+          backup_retention_days: 30
+
+          # Pulp service names
+          pulp_services:
+            - pulpcore-api
+            - pulpcore-content
+            - pulpcore-worker@1
+            - pulpcore-worker@2
+            - pulpcore-worker@3
+            - pulpcore-worker@4
+
+          # Database configuration
+          postgres_user: postgres
+          pulp_db_name: pulpcore
+
+          # Source repository (where the optimized code is)
+          pulp_container_repo_path: /home/ansiblerunner/foreman/pulp_container
+          pulp_container_branch: feature/bypass-taglist-sync-optimization
