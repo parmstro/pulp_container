@@ -1,0 +1,56 @@
+---
+# Ansible Playbook: Cleanup Old Backups
+#
+# Removes backups older than retention period
+#
+# Usage:
+#   # Use default retention (30 days)
+#   ansible-playbook -i inventory.yml cleanup-backups.yml
+#
+#   # Custom retention period
+#   ansible-playbook -i inventory.yml cleanup-backups.yml -e backup_retention_days=7
+#
+
+- name: Cleanup old pulp_container backups
+  hosts: satellite_servers
+  gather_facts: yes
+
+  tasks:
+    - name: Find old backups
+      find:
+        paths: "{{ backup_base_dir }}"
+        file_type: directory
+        age: "{{ backup_retention_days }}d"
+        recurse: no
+      register: old_backups
+
+    - name: Display backups to be removed
+      debug:
+        msg: |
+          Found {{ old_backups.matched }} backup(s) older than {{ backup_retention_days }} days:
+          {% for item in old_backups.files %}
+          - {{ item.path }} ({{ item.path | basename }})
+          {% endfor %}
+
+    - name: Confirm deletion
+      pause:
+        prompt: |
+
+          About to delete {{ old_backups.matched }} old backup(s).
+          Press Ctrl+C then 'A' to abort.
+          Press Enter to continue.
+
+      when: old_backups.matched > 0 and not (auto_confirm | default(false))
+
+    - name: Remove old backups
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_backups.files }}"
+      when: old_backups.matched > 0
+
+    - name: Summary
+      debug:
+        msg: |
+          Removed {{ old_backups.matched }} old backup(s).
+          Retention policy: {{ backup_retention_days }} days

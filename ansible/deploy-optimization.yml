@@ -1,0 +1,521 @@
+---
+# Ansible Playbook: Deploy Tag List Bypass Optimization to Satellite 6.19.3
+#
+# This playbook safely deploys the pulp_container optimization with:
+# - Pre-deployment validation
+# - Automatic backups
+# - Service management
+# - Database migration
+# - Post-deployment verification
+# - Automatic rollback on failure
+#
+# Usage:
+#   ansible-playbook -i inventory.yml deploy-optimization.yml
+#
+# Options:
+#   --check          : Dry-run mode
+#   --tags backup    : Only create backups
+#   --tags deploy    : Only deploy (skip backups - not recommended)
+#   --tags verify    : Only run verification
+#
+
+- name: Deploy pulp_container Tag List Bypass Optimization
+  hosts: satellite_servers
+  gather_facts: yes
+  vars:
+    deployment_log: "/var/log/pulp-container-optimization-deploy-{{ backup_timestamp }}.log"
+
+  tasks:
+    - name: Main deployment with automatic rollback on failure
+      tags: [always]
+      block:
+        # ====================================================================
+        # PRE-FLIGHT CHECKS
+        # ====================================================================
+
+        - name: Create deployment log
+          tags: [preflight]
+          copy:
+            content: |
+              Pulp Container Optimization Deployment
+              Started: {{ ansible_date_time.iso8601 }}
+              Host: {{ ansible_hostname }}
+              User: {{ ansible_user_id }}
+            dest: "{{ deployment_log }}"
+            mode: '0644'
+
+        - name: Check if running as root
+          tags: [preflight]
+          fail:
+            msg: "This playbook must be run as root (use --become)"
+          when: ansible_user_id != "root"
+
+        - name: Check Satellite version
+          tags: [preflight]
+          shell: |
+            satellite-maintain packages list 2>/dev/null | grep -E 'satellite-[0-9]' | head -1
+          register: satellite_version
+          changed_when: false
+          failed_when: false
+
+        - name: Display Satellite version
+          tags: [preflight]
+          debug:
+            msg: "Detected Satellite version: {{ satellite_version.stdout | default('Unable to detect') }}"
+
+        - name: Search for pulp_container installation
+          tags: [preflight]
+          shell: |
+            # Try multiple search methods
+            if [ -d /usr/lib/python3.12/site-packages/pulp_container ]; then
+              echo "/usr/lib/python3.12/site-packages/pulp_container"
+            elif [ -d /usr/lib/python3.11/site-packages/pulp_container ]; then
+              echo "/usr/lib/python3.11/site-packages/pulp_container"
+            else
+              find /usr -name "pulp_container" -type d 2>/dev/null | grep site-packages | head -1
+            fi
+          register: pulp_container_search
+          changed_when: false
+
+        - name: Fail if pulp_container not found
+          tags: [preflight]
+          fail:
+            msg: "pulp_container installation not found! Searched in /usr/lib/python3*/site-packages. Is Satellite 6.19.3 installed?"
+          when: pulp_container_search.stdout == ""
+
+        - name: Set pulp_container paths
+          tags: [preflight]
+          set_fact:
+            pulp_container_python_path: "{{ pulp_container_search.stdout }}"
+            pulp_container_app_path: "{{ pulp_container_search.stdout }}/app"
+
+        - name: Display discovered pulp_container location
+          tags: [preflight]
+          debug:
+            msg: "Found pulp_container at {{ pulp_container_python_path }} ({{ pulp_container_python_path | regex_search('python3\\.[0-9]+') }})"
+
+        - name: Verify app directory exists
+          tags: [preflight]
+          stat:
+            path: "{{ pulp_container_app_path }}"
+          register: pulp_app_check
+
+        - name: Fail if app directory not found
+          tags: [preflight]
+          fail:
+            msg: "pulp_container/app directory not found at {{ pulp_container_app_path }}"
+          when: not pulp_app_check.stat.exists
+
+        - name: Check PostgreSQL status
+          tags: [preflight]
+          systemd:
+            name: postgresql
+            state: started
+          check_mode: yes
+          register: postgres_check
+
+        - name: Verify database accessibility
+          tags: [preflight]
+          become_user: postgres
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: "SELECT 1"
+          register: db_check
+          failed_when: false
+
+        - name: Fail if database not accessible
+          tags: [preflight]
+          fail:
+            msg: "Cannot access PostgreSQL database {{ pulp_db_name }}"
+          when: db_check is failed
+
+        - name: Check pulp services status
+          tags: [preflight]
+          systemd:
+            name: "{{ item }}"
+          register: service_check
+          loop: "{{ pulp_services }}"
+          failed_when: false
+
+        - name: Display service status
+          tags: [preflight]
+          debug:
+            msg: "Service {{ item.item }}: {{ item.status.ActiveState | default('unknown') }}"
+          loop: "{{ service_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        # ====================================================================
+        # BACKUP EXISTING FILES
+        # ====================================================================
+
+        - name: Create backup directory
+          tags: [backup]
+          file:
+            path: "{{ backup_base_dir }}/{{ backup_timestamp }}"
+            state: directory
+            mode: '0777'  # Allow postgres user to write SQL dumps
+
+        - name: Create backup manifest file
+          tags: [backup]
+          copy:
+            content: |
+              Backup created: {{ ansible_date_time.iso8601 }}
+              Host: {{ ansible_hostname }}
+              Backup directory: {{ backup_base_dir }}/{{ backup_timestamp }}
+              Reason: pulp_container optimization deployment
+            dest: "{{ backup_base_dir }}/{{ backup_timestamp }}/BACKUP_MANIFEST.txt"
+            mode: '0644'
+
+        - name: Backup Python files
+          tags: [backup]
+          copy:
+            src: "{{ item.path }}"
+            dest: "{{ backup_base_dir }}/{{ backup_timestamp }}/{{ item.name }}"
+            remote_src: yes
+            mode: preserve
+          loop: "{{ pulp_container_files_to_backup }}"
+          when: not (item.is_directory | default(false))
+
+        - name: Backup migrations directory
+          tags: [backup]
+          synchronize:
+            src: "{{ item.path }}/"
+            dest: "{{ backup_base_dir }}/{{ backup_timestamp }}/{{ item.name }}/"
+            archive: yes
+          delegate_to: "{{ inventory_hostname }}"
+          loop: "{{ pulp_container_files_to_backup }}"
+          when: item.is_directory | default(false)
+
+        - name: Backup database schema (migrations state)
+          tags: [backup]
+          become_user: postgres
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: |
+              SELECT app, name, applied
+              FROM django_migrations
+              WHERE app = '{{ migration_app }}'
+              ORDER BY applied DESC
+          register: migration_state
+
+        - name: Save migration state to file
+          tags: [backup]
+          copy:
+            content: "{{ migration_state.query_result | to_nice_json }}"
+            dest: "{{ backup_base_dir }}/{{ backup_timestamp }}/migration_state.json"
+            mode: '0644'
+
+        - name: Create backup of container_containerremote table
+          tags: [backup]
+          become_user: postgres
+          postgresql_db:
+            name: "{{ pulp_db_name }}"
+            state: dump
+            target: "{{ backup_base_dir }}/{{ backup_timestamp }}/container_containerremote.sql"
+            target_opts: "--table=container_containerremote --clean --if-exists"
+
+        - name: Record backup location
+          tags: [backup]
+          set_fact:
+            current_backup_path: "{{ backup_base_dir }}/{{ backup_timestamp }}"
+
+        - name: Create latest backup symlink
+          tags: [backup]
+          file:
+            src: "{{ backup_base_dir }}/{{ backup_timestamp }}"
+            dest: "{{ backup_base_dir }}/latest"
+            state: link
+            force: yes
+
+        - name: Display backup location
+          tags: [backup]
+          debug:
+            msg: "Backup created at: {{ current_backup_path }}"
+
+        # ====================================================================
+        # STOP PULP SERVICES
+        # ====================================================================
+
+        - name: Stop all pulp services
+          tags: [deploy]
+          systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop: "{{ pulp_services }}"
+
+        - name: Wait for services to stop
+          tags: [deploy]
+          wait_for:
+            timeout: 30
+
+        - name: Verify services are stopped
+          tags: [deploy]
+          systemd:
+            name: "{{ item }}"
+          register: service_verify
+          failed_when: service_verify.status.ActiveState == "active"
+          loop: "{{ pulp_services }}"
+
+        # ====================================================================
+        # DEPLOY NEW FILES
+        # ====================================================================
+
+        - name: Copy optimized models.py
+          tags: [deploy]
+          copy:
+            src: "{{ pulp_container_repo_path }}/pulp_container/app/models.py"
+            dest: "{{ pulp_container_app_path }}/models.py"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Copy optimized sync_stages.py
+          tags: [deploy]
+          copy:
+            src: "{{ pulp_container_repo_path }}/pulp_container/app/tasks/sync_stages.py"
+            dest: "{{ pulp_container_app_path }}/tasks/sync_stages.py"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Copy optimized synchronize.py
+          tags: [deploy]
+          copy:
+            src: "{{ pulp_container_repo_path }}/pulp_container/app/tasks/synchronize.py"
+            dest: "{{ pulp_container_app_path }}/tasks/synchronize.py"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Copy migration file
+          tags: [deploy]
+          copy:
+            src: "{{ pulp_container_repo_path }}/pulp_container/app/migrations/{{ migration_file }}"
+            dest: "{{ pulp_container_app_path }}/migrations/{{ migration_file }}"
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Compile Python files
+          tags: [deploy]
+          shell: |
+            python3 -m py_compile {{ pulp_container_app_path }}/models.py
+            python3 -m py_compile {{ pulp_container_app_path }}/tasks/sync_stages.py
+            python3 -m py_compile {{ pulp_container_app_path }}/tasks/synchronize.py
+          register: compile_result
+          failed_when: compile_result.rc != 0
+
+        # ====================================================================
+        # RUN DATABASE MIGRATION
+        # ====================================================================
+
+        - name: Check pending migrations
+          tags: [deploy, migrate]
+          become_user: pulp
+          shell: |
+            pulpcore-manager showmigrations {{ migration_app }} | grep -E '\[ \]' | wc -l
+          environment:
+            PULP_SETTINGS: /etc/pulp/settings.py
+            DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+          register: pending_migrations
+          changed_when: false
+
+        - name: Display pending migrations count
+          tags: [deploy, migrate]
+          debug:
+            msg: "Pending migrations: {{ pending_migrations.stdout }}"
+
+        - name: Run Django migrations
+          tags: [deploy, migrate]
+          become_user: pulp
+          shell: |
+            pulpcore-manager migrate {{ migration_app }}
+          environment:
+            PULP_SETTINGS: /etc/pulp/settings.py
+            DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+          register: migration_result
+
+        - name: Display migration output
+          tags: [deploy, migrate]
+          debug:
+            var: migration_result.stdout_lines
+
+        - name: Verify migration applied
+          tags: [deploy, migrate]
+          become_user: "{{ postgres_user }}"
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: |
+              SELECT name FROM django_migrations
+              WHERE app = '{{ migration_app }}'
+              AND name = '{{ migration_file.replace('.py', '') }}'
+          register: migration_verify
+
+        - name: Fail if migration not applied
+          tags: [deploy, migrate]
+          fail:
+            msg: "Migration {{ migration_file }} was not applied successfully"
+          when: migration_verify.rowcount == 0
+
+        - name: Verify auto_discover_cosign column exists
+          tags: [deploy, migrate]
+          become_user: "{{ postgres_user }}"
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: |
+              SELECT column_name, data_type, column_default
+              FROM information_schema.columns
+              WHERE table_name='container_containerremote'
+              AND column_name='auto_discover_cosign'
+          register: column_check
+
+        - name: Display column info
+          tags: [deploy, migrate]
+          debug:
+            var: column_check.query_result
+
+        - name: Fail if column not found
+          tags: [deploy, migrate]
+          fail:
+            msg: "Column auto_discover_cosign not found in container_containerremote"
+          when: column_check.rowcount == 0
+
+        # ====================================================================
+        # RESTART PULP SERVICES
+        # ====================================================================
+
+        - name: Start all pulp services
+          tags: [deploy]
+          systemd:
+            name: "{{ item }}"
+            state: started
+          loop: "{{ pulp_services }}"
+
+        - name: Wait for services to start
+          tags: [deploy]
+          wait_for:
+            timeout: 30
+
+        - name: Verify services are running
+          tags: [deploy]
+          systemd:
+            name: "{{ item }}"
+          register: service_running
+          failed_when: service_running.status.ActiveState != "active"
+          loop: "{{ pulp_services }}"
+
+        # ====================================================================
+        # POST-DEPLOYMENT VERIFICATION
+        # ====================================================================
+
+        - name: Wait for Pulp API to be responsive
+          tags: [verify]
+          shell: curl -k -s -o /dev/null -w "%{http_code}" https://{{ ansible_host }}/pulp/api/v3/status/
+          register: api_check
+          until: api_check.stdout == "200"
+          retries: 12
+          delay: 5
+          changed_when: false
+
+        - name: Check Satellite health
+          tags: [verify]
+          shell: satellite-maintain health check --assumeyes
+          register: health_check
+          failed_when: false
+
+        - name: Display health check results
+          tags: [verify]
+          debug:
+            var: health_check.stdout_lines
+
+        - name: Verify all remotes have auto_discover_cosign field
+          tags: [verify]
+          become_user: "{{ postgres_user }}"
+          postgresql_query:
+            db: "{{ pulp_db_name }}"
+            query: |
+              SELECT upstream_name, auto_discover_cosign
+              FROM container_containerremote
+              LIMIT 5
+          register: remote_check
+
+        - name: Display remote auto_discover_cosign values
+          tags: [verify]
+          debug:
+            var: remote_check.query_result
+
+        - name: Create deployment success marker
+          tags: [verify]
+          copy:
+            content: |
+              Deployment successful
+              Completed: {{ ansible_date_time.iso8601 }}
+              Backup location: {{ current_backup_path }}
+              Migration applied: {{ migration_file }}
+            dest: "{{ backup_base_dir }}/{{ backup_timestamp }}/DEPLOYMENT_SUCCESS.txt"
+            mode: '0644'
+
+        # ====================================================================
+        # FINAL REPORT
+        # ====================================================================
+
+        - name: Deployment completed successfully
+          pause:
+            seconds: 1
+            prompt: |
+
+              ========================================
+              DEPLOYMENT COMPLETED SUCCESSFULLY
+              ========================================
+              Timestamp: {{ ansible_date_time.iso8601 }}
+              Host: {{ ansible_hostname }}
+              Backup location: {{ current_backup_path }}
+              Migration applied: {{ migration_file }}
+
+              Services status: All running
+              API status: Healthy
+              Database: Migration successful
+
+              Next steps:
+              1. Review deployment log: {{ deployment_log }}
+              2. Test the optimization with a sample sync
+              3. Monitor logs: journalctl -u pulpcore-worker* -f
+
+              To rollback:
+              ansible-playbook -i inventory.yml rollback-optimization.yml -e backup_path={{ current_backup_path }}
+              ========================================
+
+      rescue:
+        # ====================================================================
+        # AUTOMATIC ROLLBACK ON FAILURE
+        # ====================================================================
+
+        - name: Deployment failed - initiating automatic rollback
+          debug:
+            msg: "Deployment failed. Starting automatic rollback..."
+
+        - name: Determine backup path for rollback
+          set_fact:
+            rollback_backup_path: "{{ current_backup_path | default(backup_base_dir + '/latest') }}"
+
+        - name: Check if backup was created
+          stat:
+            path: "{{ rollback_backup_path }}"
+          register: backup_exists
+
+        - name: Include rollback tasks
+          include_tasks: rollback-tasks.yml
+          vars:
+            rollback_reason: "Automatic rollback due to deployment failure"
+            backup_path: "{{ rollback_backup_path }}"
+          when: backup_exists.stat.exists
+
+        - name: Warn if no backup available
+          debug:
+            msg: "WARNING: Deployment failed before backup was created. Manual recovery may be needed."
+          when: not backup_exists.stat.exists
+
+        - name: Final failure message
+          fail:
+            msg: "Deployment failed{{ ' and has been rolled back' if backup_exists.stat.exists else ' (no backup to rollback)' }}. {{ 'Backup at ' + rollback_backup_path if backup_exists.stat.exists else 'Manual recovery needed' }}. Check logs {{ deployment_log }}"

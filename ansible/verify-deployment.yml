@@ -1,0 +1,151 @@
+---
+# Ansible Playbook: Verify Deployment Status
+#
+# Quick verification playbook to check if the optimization is deployed
+#
+# Usage:
+#   ansible-playbook -i inventory.yml verify-deployment.yml
+#
+
+- name: Verify pulp_container optimization deployment status
+  hosts: satellite_servers
+  gather_facts: yes
+
+  tasks:
+    - name: Search for pulp_container installation
+      shell: |
+        # Try multiple search methods
+        if [ -d /usr/lib/python3.12/site-packages/pulp_container ]; then
+          echo "/usr/lib/python3.12/site-packages/pulp_container"
+        elif [ -d /usr/lib/python3.11/site-packages/pulp_container ]; then
+          echo "/usr/lib/python3.11/site-packages/pulp_container"
+        else
+          find /usr -name "pulp_container" -type d 2>/dev/null | grep site-packages | head -1
+        fi
+      register: pulp_container_search
+      changed_when: false
+
+    - name: Set pulp_container paths
+      set_fact:
+        pulp_container_python_path: "{{ pulp_container_search.stdout }}"
+        pulp_container_app_path: "{{ pulp_container_search.stdout }}/app"
+      when: pulp_container_search.stdout != ""
+
+    - name: Display pulp_container location
+      debug:
+        msg: "Found pulp_container at: {{ pulp_container_python_path | default('NOT FOUND') }}"
+
+    - name: Check if auto_discover_cosign column exists
+      become_user: "{{ postgres_user }}"
+      postgresql_query:
+        db: "{{ pulp_db_name }}"
+        query: |
+          SELECT column_name, data_type, column_default
+          FROM information_schema.columns
+          WHERE table_name='container_containerremote'
+          AND column_name='auto_discover_cosign'
+      register: column_check
+
+    - name: Check migration status
+      become_user: pulp
+      shell: |
+        pulpcore-manager showmigrations {{ migration_app }} | grep "0046_containerremote_auto_discover_cosign"
+      environment:
+        PULP_SETTINGS: /etc/pulp/settings.py
+        DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+      register: migration_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check service status
+      systemd:
+        name: "{{ item }}"
+      register: service_status
+      loop: "{{ pulp_services }}"
+
+    - name: Query sample remotes
+      become_user: "{{ postgres_user }}"
+      postgresql_query:
+        db: "{{ pulp_db_name }}"
+        query: |
+          SELECT name, includes, excludes, auto_discover_cosign
+          FROM container_containerremote
+          LIMIT 5
+      register: remote_sample
+
+    - name: Check API status
+      uri:
+        url: "https://{{ ansible_host }}/pulp/api/v3/status/"
+        validate_certs: no
+        status_code: 200
+      register: api_status
+      failed_when: false
+
+    - name: Display deployment status header
+      debug:
+        msg:
+          - "========================================"
+          - "DEPLOYMENT STATUS"
+          - "========================================"
+
+    - name: Display database column status
+      debug:
+        msg: "Database Column: {{ 'DEPLOYED' if column_check.rowcount > 0 else 'NOT DEPLOYED' }}"
+
+    - name: Display column details
+      debug:
+        var: column_check.query_result
+      when: column_check.rowcount > 0
+
+    - name: Display migration status
+      debug:
+        msg: "Migration Status: {{ migration_check.stdout if migration_check.rc == 0 else 'Migration not found' }}"
+
+    - name: Display services status
+      debug:
+        msg: "{{ item.item }}: {{ item.status.ActiveState }}"
+      loop: "{{ service_status.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Display API status
+      debug:
+        msg: "API Status: {{ 'Healthy (HTTP ' + (api_status.status | string) + ')' if api_status.status == 200 else 'Unhealthy' }}"
+
+    - name: Display sample remotes
+      debug:
+        msg: "Sample Remotes:"
+
+    - name: Show remote details
+      debug:
+        var: remote_sample.query_result
+
+    - name: Status footer
+      debug:
+        msg: "========================================"
+
+    - name: Set deployment fact
+      set_fact:
+        is_deployed: "{{ column_check.rowcount > 0 }}"
+
+    - name: Summary
+      debug:
+        msg: "========== Optimization is {{ 'DEPLOYED' if is_deployed else 'NOT DEPLOYED' }} =========="
+
+    - name: Display deployed instructions
+      pause:
+        seconds: 1
+        prompt: |
+
+          The tag list bypass optimization is ACTIVE on this system.
+          All container remotes have auto_discover_cosign enabled by default.
+
+          To test: Create a remote with specific includes (no wildcards)
+          and sync - it should bypass /tags/list.
+
+      when: is_deployed
+
+    - name: Display not deployed instructions
+      debug:
+        msg: "Optimization NOT DEPLOYED. To deploy: ansible-playbook -i inventory.yml deploy-optimization.yml"
+      when: not is_deployed

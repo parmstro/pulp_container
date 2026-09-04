@@ -1,0 +1,27 @@
+---
+# Group variables for Satellite servers
+
+# Note: pulp_container_python_path and pulp_container_app_path are discovered
+# dynamically during playbook execution by searching /usr/lib/python3*/site-packages
+
+# Files to backup (relative paths, will be prefixed with discovered path)
+pulp_container_files_to_backup:
+  - path: "{{ pulp_container_app_path }}/models.py"
+    name: models.py
+  - path: "{{ pulp_container_app_path }}/tasks/sync_stages.py"
+    name: sync_stages.py
+  - path: "{{ pulp_container_app_path }}/tasks/synchronize.py"
+    name: synchronize.py
+  - path: "{{ pulp_container_app_path }}/migrations"
+    name: migrations
+    is_directory: true
+
+# Migration file to check
+migration_file: "0046_containerremote_auto_discover_cosign.py"
+migration_app: "container"
+
+# Health check endpoints
+satellite_health_endpoint: "https://{{ ansible_host }}/api/status"
+
+# Backup timestamp format
+backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
