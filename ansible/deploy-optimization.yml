@@ -234,6 +234,56 @@
             msg: "Backup created at: {{ current_backup_path }}"
 
         # ====================================================================
+        # WAIT FOR RUNNING TASKS TO DRAIN
+        # ====================================================================
+
+        - name: Check for running pulp tasks
+          tags: [deploy]
+          become_user: pulp
+          shell: |
+            pulpcore-manager shell -c "
+            from pulpcore.app.models import Task
+            running = Task.objects.filter(state__in=['running', 'waiting', 'canceling'])
+            for t in running[:20]:
+                print('{0}  {1}  {2}'.format(t.pulp_id, t.state.ljust(10), t.name))
+            print('TOTAL: {0}'.format(running.count()))
+            "
+          environment:
+            PULP_SETTINGS: /etc/pulp/settings.py
+            DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+          register: running_tasks
+          changed_when: false
+
+        - name: Display running tasks
+          tags: [deploy]
+          debug:
+            msg: "{{ running_tasks.stdout_lines }}"
+
+        - name: Wait for running tasks to drain
+          tags: [deploy]
+          become_user: pulp
+          shell: |
+            pulpcore-manager shell -c "
+            from pulpcore.app.models import Task
+            count = Task.objects.filter(state__in=['running', 'waiting', 'canceling']).count()
+            print(count)
+            "
+          environment:
+            PULP_SETTINGS: /etc/pulp/settings.py
+            DJANGO_SETTINGS_MODULE: pulpcore.app.settings
+          register: task_count
+          until: task_count.stdout | trim | int == 0
+          retries: 60
+          delay: 30
+          changed_when: false
+          when: "running_tasks.stdout is search('TOTAL: [1-9]')"
+
+        - name: Confirm all tasks drained
+          tags: [deploy]
+          debug:
+            msg: "All pulp tasks have completed. Safe to proceed with deployment."
+
+        # ====================================================================
         # STOP PULP SERVICES
         # ====================================================================
 
