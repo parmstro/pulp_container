@@ -1,0 +1,192 @@
+---
+# Playbook: Push OCP Product Definition to Satellite
+#
+# Standalone playbook that uses the redhat.satellite collection to create
+# or update an OCP container product and its repositories on a Satellite
+# server. Uses the same logic as the rhis-builder-satellite custom_products
+# role but operates independently.
+#
+# Prerequisites:
+#   - redhat.satellite collection installed
+#   - Generated tag files in generated/ (run generate-ocp-product.yml first)
+#   - Vault file with quay.io credentials (run extract-pull-secret.sh first)
+#
+# Usage:
+#   ansible-playbook push-ocp-product.yml \
+#     -e ocp_minor=4.20 \
+#     -e satellite_url=https://satellite1.example.ca \
+#     -e satellite_username=admin \
+#     -e satellite_password=<password> \
+#     --ask-vault-pass
+#
+#   # Or with GSSAPI authentication:
+#   ansible-playbook push-ocp-product.yml \
+#     -e ocp_minor=4.20 \
+#     -e satellite_url=https://satellite1.example.ca \
+#     -e satellite_use_gssapi=true \
+#     --ask-vault-pass
+#
+#   # Optionally trigger a sync after creating:
+#   ansible-playbook push-ocp-product.yml \
+#     -e ocp_minor=4.20 \
+#     -e satellite_url=https://satellite1.example.ca \
+#     -e satellite_username=admin \
+#     -e satellite_password=<password> \
+#     -e sync_after_create=true \
+#     --ask-vault-pass
+#
+
+- name: Push OCP product to Satellite
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    satellite_organization: "Default Organization"
+    satellite_validate_certs: true
+    sync_after_create: false
+    tags_file: "{{ playbook_dir }}/generated/ocp_{{ ocp_minor | replace('.', '') }}_tags.yml"
+    product_name: "OpenShift Container Platform {{ ocp_minor }}"
+    product_label: "ocp-{{ ocp_minor | replace('.', '-') }}"
+
+  vars_files:
+    - "group_vars/vault_quay_credentials.yml"
+
+  pre_tasks:
+    - name: Validate required variables
+      assert:
+        that:
+          - ocp_minor is defined
+          - satellite_url is defined
+          - (satellite_username is defined and satellite_password is defined) or satellite_use_gssapi | default(false)
+        fail_msg: >
+          Required variables: ocp_minor, satellite_url, and either
+          satellite_username/satellite_password or satellite_use_gssapi=true
+
+    - name: Validate tags file exists
+      stat:
+        path: "{{ tags_file }}"
+      register: tags_stat
+      failed_when: not tags_stat.stat.exists
+
+    - name: Load OCP tag lists
+      include_vars:
+        file: "{{ tags_file }}"
+
+  tasks:
+    # ==================================================================
+    # ENSURE PRODUCT
+    # ==================================================================
+
+    - name: "Ensure custom product - {{ product_name }}"
+      redhat.satellite.product:
+        username: "{{ satellite_username | default(omit) }}"
+        password: "{{ satellite_password | default(omit) }}"
+        use_gssapi: "{{ satellite_use_gssapi | default(omit) }}"
+        server_url: "{{ satellite_url }}"
+        organization: "{{ satellite_organization }}"
+        validate_certs: "{{ satellite_validate_certs }}"
+        name: "{{ product_name }}"
+        label: "{{ product_label }}"
+        description: "OCP {{ ocp_minor }} release and component container images"
+        state: present
+
+    # ==================================================================
+    # ENSURE REPOSITORIES
+    # ==================================================================
+
+    - name: "Ensure repository - ocp-release"
+      redhat.satellite.repository:
+        username: "{{ satellite_username | default(omit) }}"
+        password: "{{ satellite_password | default(omit) }}"
+        use_gssapi: "{{ satellite_use_gssapi | default(omit) }}"
+        server_url: "{{ satellite_url }}"
+        organization: "{{ satellite_organization }}"
+        validate_certs: "{{ satellite_validate_certs }}"
+        product: "{{ product_name }}"
+        name: "ocp-release"
+        label: "ocp-release"
+        description: "OCP {{ ocp_minor }} release images"
+        content_type: "docker"
+        docker_upstream_name: "openshift-release-dev/ocp-release"
+        url: "https://quay.io"
+        upstream_username: "{{ quay_registry_username_vault }}"
+        upstream_password: "{{ quay_registry_password_vault }}"
+        download_policy: "immediate"
+        mirroring_policy: "additive"
+        include_tags: "{{ vars['ocp_' + ocp_minor | replace('.', '') + '_release_tags'] | join(',') }}"
+        exclude_tags: "*-source"
+        state: present
+      register: repo_release
+
+    - name: "Ensure repository - ocp-v4.0-art-dev"
+      redhat.satellite.repository:
+        username: "{{ satellite_username | default(omit) }}"
+        password: "{{ satellite_password | default(omit) }}"
+        use_gssapi: "{{ satellite_use_gssapi | default(omit) }}"
+        server_url: "{{ satellite_url }}"
+        organization: "{{ satellite_organization }}"
+        validate_certs: "{{ satellite_validate_certs }}"
+        product: "{{ product_name }}"
+        name: "ocp-v4.0-art-dev"
+        label: "ocp-v4_0-art-dev"
+        description: "OCP {{ ocp_minor }} component images"
+        content_type: "docker"
+        docker_upstream_name: "openshift-release-dev/ocp-v4.0-art-dev"
+        url: "https://quay.io"
+        upstream_username: "{{ quay_registry_username_vault }}"
+        upstream_password: "{{ quay_registry_password_vault }}"
+        download_policy: "immediate"
+        mirroring_policy: "additive"
+        include_tags: "{{ vars['ocp_' + ocp_minor | replace('.', '') + '_art_dev_tags'] | join(',') }}"
+        exclude_tags: "*-source"
+        state: present
+      register: repo_art_dev
+
+    # ==================================================================
+    # OPTIONAL SYNC
+    # ==================================================================
+
+    - name: "Sync ocp-release repository"
+      redhat.satellite.repository_sync:
+        username: "{{ satellite_username | default(omit) }}"
+        password: "{{ satellite_password | default(omit) }}"
+        use_gssapi: "{{ satellite_use_gssapi | default(omit) }}"
+        server_url: "{{ satellite_url }}"
+        organization: "{{ satellite_organization }}"
+        validate_certs: "{{ satellite_validate_certs }}"
+        product: "{{ product_name }}"
+        repository: "ocp-release"
+      when: sync_after_create | bool
+
+    - name: "Sync ocp-v4.0-art-dev repository"
+      redhat.satellite.repository_sync:
+        username: "{{ satellite_username | default(omit) }}"
+        password: "{{ satellite_password | default(omit) }}"
+        use_gssapi: "{{ satellite_use_gssapi | default(omit) }}"
+        server_url: "{{ satellite_url }}"
+        organization: "{{ satellite_organization }}"
+        validate_certs: "{{ satellite_validate_certs }}"
+        product: "{{ product_name }}"
+        repository: "ocp-v4.0-art-dev"
+      when: sync_after_create | bool
+
+    # ==================================================================
+    # SUMMARY
+    # ==================================================================
+
+    - name: Summary
+      debug:
+        msg: |
+          ========================================
+          OCP PRODUCT PUSHED TO SATELLITE
+          ========================================
+          Satellite: {{ satellite_url }}
+          Product: {{ product_name }}
+          Repositories:
+            - ocp-release ({{ vars['ocp_' + ocp_minor | replace('.', '') + '_release_tags'] | length }} release digests)
+            - ocp-v4.0-art-dev ({{ vars['ocp_' + ocp_minor | replace('.', '') + '_art_dev_tags'] | length }} component digests)
+          Download policy: immediate
+          Mirroring policy: additive
+          Sync triggered: {{ sync_after_create | bool }}
+          ========================================
