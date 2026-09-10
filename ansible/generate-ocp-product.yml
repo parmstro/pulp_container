@@ -1,0 +1,181 @@
+---
+# Playbook: Generate OCP Container Product Definition for rhis-builder-satellite
+#
+# Fetches an OpenShift release.txt, parses the container image digests, and
+# generates a custom_products YAML entry compatible with rhis-builder-satellite.
+#
+# Accumulates digests across z-stream releases into a single product per OCP
+# minor version. Use content views to snapshot specific z-stream releases.
+#
+# Usage:
+#   ansible-playbook generate-ocp-product.yml -e ocp_version=4.20.32
+#   ansible-playbook generate-ocp-product.yml -e ocp_version=4.20.33   # merges with existing
+#
+# Output:
+#   generated/ocp-4.20-custom-product.yml   (product entry for custom_products.yml)
+#   generated/ocp_420_tags.yml              (tag lists for host_vars/)
+#   generated/ocp-4.20-repositories.yml    (repository entries for repositories.yml)
+#
+
+- name: Generate OCP container product definition
+  hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    ocp_minor: "{{ ocp_version | regex_replace('^([0-9]+\\.[0-9]+)\\.[0-9]+$', '\\1') }}"
+    release_base_url: "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp"
+    release_url: "{{ release_base_url }}/{{ ocp_version }}/release.txt"
+    output_dir: "{{ playbook_dir }}/generated"
+    output_file: "{{ output_dir }}/ocp-{{ ocp_minor }}-custom-product.yml"
+    tags_file: "{{ output_dir }}/ocp_{{ ocp_minor | replace('.', '') }}_tags.yml"
+    repos_file: "{{ output_dir }}/ocp-{{ ocp_minor }}-repositories.yml"
+    versions_file: "{{ output_dir }}/ocp-{{ ocp_minor }}-versions.json"
+
+  tasks:
+    - name: Validate ocp_version format
+      assert:
+        that:
+          - ocp_version is defined
+          - "ocp_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')"
+        fail_msg: "Provide ocp_version in X.Y.Z format, e.g. -e ocp_version=4.20.32"
+
+    - name: Display configuration
+      debug:
+        msg: |
+          OCP Version: {{ ocp_version }}
+          Minor: {{ ocp_minor }}
+          Release URL: {{ release_url }}
+          Output: {{ output_file }}
+
+    # ==================================================================
+    # FETCH AND PARSE RELEASE.TXT
+    # ==================================================================
+
+    - name: Fetch release.txt
+      uri:
+        url: "{{ release_url }}"
+        return_content: yes
+        status_code: 200
+      register: release_txt
+
+    - name: Parse release digest
+      set_fact:
+        release_digest: "{{ release_txt.content | regex_search('Pull From:.*@(sha256:[a-f0-9]+)', '\\1') | first }}"
+
+    - name: Parse component image lines
+      set_fact:
+        component_lines: "{{ release_txt.content.split('\n') | select('match', '^ *\\S+\\s+quay\\.io/openshift-release-dev/ocp-v4\\.0-art-dev@sha256:') | list }}"
+
+    - name: Extract component digests
+      set_fact:
+        art_dev_digests: "{{ component_lines | map('regex_search', '(sha256:[a-f0-9]+)') | select | unique | sort | list }}"
+
+    - name: Display parse results
+      debug:
+        msg: |
+          Release digest: {{ release_digest }}
+          Component images: {{ art_dev_digests | length }}
+
+    # ==================================================================
+    # MERGE WITH EXISTING (accumulate across z-streams)
+    # ==================================================================
+
+    - name: Create output directory
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Check for existing versions file
+      stat:
+        path: "{{ versions_file }}"
+      register: versions_stat
+
+    - name: Load existing versions
+      set_fact:
+        existing_versions: "{{ lookup('file', versions_file) | from_json }}"
+      when: versions_stat.stat.exists
+
+    - name: Initialize versions tracking
+      set_fact:
+        existing_versions:
+          included_versions: []
+          release_tags: []
+          art_dev_tags: []
+      when: not versions_stat.stat.exists
+
+    - name: Merge release tags
+      set_fact:
+        merged_release_tags: "{{ (existing_versions.release_tags | default([])) | union([release_digest]) | sort }}"
+
+    - name: Merge component tags
+      set_fact:
+        merged_art_dev_tags: "{{ (existing_versions.art_dev_tags | default([])) | union(art_dev_digests) | sort }}"
+
+    - name: Update included versions list
+      set_fact:
+        included_versions: "{{ (existing_versions.included_versions | default([])) | union([ocp_version]) | sort }}"
+
+    - name: Display merge results
+      debug:
+        msg: |
+          Z-stream releases: {{ included_versions | join(', ') }}
+          Total release digests: {{ merged_release_tags | length }}
+          Total component digests: {{ merged_art_dev_tags | length }}
+          New component digests added: {{ merged_art_dev_tags | length - (existing_versions.art_dev_tags | default([]) | length) }}
+
+    # ==================================================================
+    # GENERATE OUTPUT FILES
+    # ==================================================================
+
+    - name: Save versions tracking data
+      copy:
+        content: "{{ versions_data | to_nice_json }}"
+        dest: "{{ versions_file }}"
+        mode: '0644'
+      vars:
+        versions_data:
+          ocp_minor: "{{ ocp_minor }}"
+          included_versions: "{{ included_versions }}"
+          release_tags: "{{ merged_release_tags }}"
+          art_dev_tags: "{{ merged_art_dev_tags }}"
+          last_updated: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Generate custom product YAML
+      template:
+        src: templates/ocp-custom-product.yml.j2
+        dest: "{{ output_file }}"
+        mode: '0644'
+
+    - name: Generate tags file
+      template:
+        src: templates/ocp-tags.yml.j2
+        dest: "{{ tags_file }}"
+        mode: '0644'
+
+    - name: Generate repositories file
+      template:
+        src: templates/ocp-repositories.yml.j2
+        dest: "{{ repos_file }}"
+        mode: '0644'
+
+    - name: Summary
+      debug:
+        msg: |
+          ========================================
+          PRODUCT DEFINITION GENERATED
+          ========================================
+          Output: {{ output_file }}
+          Product: OpenShift Container Platform {{ ocp_minor }}
+          Z-streams: {{ included_versions | join(', ') }}
+          Release digests: {{ merged_release_tags | length }}
+          Component digests: {{ merged_art_dev_tags | length }}
+
+          Next steps:
+          1. Review: cat {{ output_file }}
+          2. Copy tags file to host_vars: cp {{ tags_file }} <inventory>/host_vars/<host>/
+          3. Merge product entry into custom_products.yml (uses join references)
+          4. Append repository entries from {{ repos_file }} into repositories.yml
+          5. Run rhis-builder-satellite to apply
+          ========================================
