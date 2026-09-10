@@ -8,6 +8,8 @@ all:
       hosts:
         satellite1:
           ansible_host: satellite1.parmstrong.ca
+        satellite1-dev:
+          ansible_host: satellite1.example.ca
           ansible_user: ansiblerunner
           ansible_become: yes
           ansible_python_interpreter: /usr/bin/python3.12
