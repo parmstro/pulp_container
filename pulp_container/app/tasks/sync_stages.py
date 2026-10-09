@@ -112,12 +112,32 @@ class ContainerFirstStage(Stage):
 
         return content_data, raw_text_data, response
 
+    @staticmethod
+    def _parse_tag_entry(entry):
+        """
+        Parse an include_tags entry into (digest, alias_name).
+
+        Supports two formats:
+        - "sha256:abc123..." — plain digest, no alias
+        - "name=sha256:abc123..." — named alias for a digest
+
+        Returns (digest, alias) where alias is None for plain digests.
+        """
+        if '=' in entry and not entry.startswith('sha256:'):
+            name, _, digest = entry.partition('=')
+            if digest.startswith('sha256:'):
+                return digest, name
+        if entry.startswith('sha256:'):
+            return entry, None
+        return None, None
+
     def _can_bypass_taglist(self):
         """
         Check if we can safely bypass /tags/list enumeration.
 
         Returns True only if:
         - include_tags is populated (specific refs to sync)
+        - All entries are sha256 digests or name=sha256:digest aliases
         - exclude_tags is empty OR won't match any includes (harmless)
         - No wildcards in include_tags (need exact refs, not patterns)
         - Not in mirror mode (would need full list to detect removals)
@@ -128,26 +148,25 @@ class ContainerFirstStage(Stage):
         if not include_tags:
             return False
 
-        # If excludes exist, check if they're harmless (won't match our includes)
+        # All entries must be sha256 digests or name=sha256:digest aliases
+        digests = []
+        for entry in include_tags:
+            digest, _ = self._parse_tag_entry(entry)
+            if not digest:
+                return False
+            digests.append(digest)
+
+        # If excludes exist, check if they're harmless (won't match our digests)
         if exclude_tags:
-            # Satellite often adds '*-source' exclude which doesn't match sha256 digests
-            # If all our includes are sha256 digests and excludes only have patterns
-            # that won't match digests, we can still bypass
-            all_digests = all(tag.startswith('sha256:') for tag in include_tags)
             harmless_excludes = all(
                 exclude.endswith('-source') or
-                (exclude.startswith('*') and not any(tag.endswith(exclude.lstrip('*')) for tag in include_tags))
+                (exclude.startswith('*') and not any(d.endswith(exclude.lstrip('*')) for d in digests))
                 for exclude in exclude_tags
             )
-            if not (all_digests and harmless_excludes):
+            if not harmless_excludes:
                 return False
 
         if self.mirror:
-            return False
-
-        wildcard_chars = ['*', '?', '[']
-        includes_str = ''.join(include_tags)
-        if any(char in includes_str for char in wildcard_chars):
             return False
 
         return True
@@ -161,12 +180,28 @@ class ContainerFirstStage(Stage):
         # Optimization: if syncing specific refs (no wildcards, no excludes),
         # skip expensive /tags/list enumeration and sync them directly
         if self._can_bypass_taglist():
-            log.info(
-                "Bypassing /tags/list enumeration - syncing %d explicit references directly",
-                len(self.remote.include_tags),
-            )
+            digest_list = []
+            self._tag_aliases = {}
+            for entry in self.remote.include_tags:
+                digest, alias = self._parse_tag_entry(entry)
+                digest_list.append(digest)
+                if alias:
+                    self._tag_aliases[digest] = alias
+
+            if self._tag_aliases:
+                log.info(
+                    "Bypassing /tags/list enumeration - syncing %d explicit references "
+                    "directly (%d with named aliases)",
+                    len(digest_list),
+                    len(self._tag_aliases),
+                )
+            else:
+                log.info(
+                    "Bypassing /tags/list enumeration - syncing %d explicit references directly",
+                    len(digest_list),
+                )
             await self._process_tags(
-                self.remote.include_tags, signature_source, msg="Processing Manifests"
+                digest_list, signature_source, msg="Processing Manifests"
             )
 
             # Auto-discover cosign companion tags if enabled
@@ -336,6 +371,12 @@ class ContainerFirstStage(Stage):
 
                 tag_dc = DeclarativeContent(Tag(name=tag_name))
 
+                # Check for a named alias for this digest (e.g. "cluster-version-operator")
+                alias_name = getattr(self, '_tag_aliases', {}).get(tag_name)
+                alias_dc = None
+                if alias_name:
+                    alias_dc = DeclarativeContent(Tag(name=alias_name))
+
                 if media_type in (MEDIA_TYPE.MANIFEST_LIST, MEDIA_TYPE.INDEX_OCI):
                     list_dc = self.create_manifest_list(
                         content_data, raw_text_data, media_type, digest=digest
@@ -382,6 +423,9 @@ class ContainerFirstStage(Stage):
                             self.manifest_dcs.append(listed_manifest["manifest_dc"])
                         self.manifest_list_dcs.append(list_dc)
                         self.tag_dcs.append(tag_dc)
+                        if alias_dc:
+                            alias_dc.extra_data["tagged_manifest_dc"] = list_dc
+                            self.tag_dcs.append(alias_dc)
 
                 else:
                     # Simple tagged manifest
@@ -397,6 +441,9 @@ class ContainerFirstStage(Stage):
                     tag_dc.extra_data["tagged_manifest_dc"] = man_dc
                     await self.handle_blobs(man_dc, content_data)
                     self.tag_dcs.append(tag_dc)
+                    if alias_dc:
+                        alias_dc.extra_data["tagged_manifest_dc"] = man_dc
+                        self.tag_dcs.append(alias_dc)
                     self.manifest_dcs.append(man_dc)
 
                 # Count the skipped tasks as parsed too.
